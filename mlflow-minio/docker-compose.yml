@@ -1,0 +1,112 @@
+version: '3.3'
+
+networks:
+  enpower:
+    name: enpower
+
+ 
+
+volumes:
+  database:
+  artifact-store:
+  enpower_postgres:
+
+services:
+  s3:
+    image: minio/minio:RELEASE.2020-12-18T03-27-42Z
+    container_name: s3
+    restart: always
+    hostname: s3
+    volumes:
+      - artifact-store:/data
+    ports:
+      - ${MINIO_PORT}:${MINIO_PORT}
+    environment:
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+    command: server /data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${MINIO_PORT}/minio/health/live"]
+      interval: 10s
+      timeout: 10s
+      retries: 3
+    networks:
+      - default
+
+  create_bucket:
+    image: minio/mc:RELEASE.2019-07-17T22-13-42Z
+    depends_on:
+      - s3    
+    environment:
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET__KEY: ${MINIO_SECRET_KEY}
+    entrypoint: >
+      /bin/sh -c '
+      sleep 5;
+      /usr/bin/mc config host add s3 http://s3:${MINIO_PORT} ${MINIO_ACCESS_KEY} ${MINIO_SECRET_KEY} --api S3v4;
+      [[ ! -z "`/usr/bin/mc ls s3 | grep challenge`" ]] || /usr/bin/mc mb s3/${BUCKET_NAME};
+      /usr/bin/mc policy download s3/${BUCKET_NAME};
+      /usr/bin/mc policy set public s3/${BUCKET_NAME};
+      exit 0;
+      '
+    networks:
+      - default
+
+  pgdb:
+    container_name: pgdb
+    restart: always
+    build: ./docker-db
+    image: pgdb
+    volumes:
+      - database:/var/lib/postgresql/data
+    ports:
+      - 5555:5432
+    expose:
+      - '5555'
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DATABASE: ${POSTGRES_DATABASE}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    networks:
+      - default
+
+  enpower_postgres:
+      hostname: ${ENPOWER_HOST}
+      container_name: ${ENPOWER_HOST}
+      image: postgres:15.1-alpine
+      restart: always
+      networks:
+        - enpower
+      ports:
+        - 5432:5432
+      volumes:
+        - enpower_postgres:/var/lib/postgresql/data
+      environment:
+        POSTGRES_USER: ${ENPOWER_USER}
+        POSTGRES_PASSWORD: ${ENPOWER_PASS}
+        POSTGRES_DB: ${ENPOWER_DB}
+
+  mlflow_server:
+    restart: always
+    build: ./docker-mlflow-server
+    image: mlflow_server
+    container_name: mlflow_server
+    ports:
+      - 5000:5000
+    expose:
+      - 5000
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_DATABASE: ${POSTGRES_DATABASE}
+      MLFLOW_S3_ENDPOINT_URL: http://s3:${MINIO_PORT}
+      AWS_ACCESS_KEY_ID: ${MINIO_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_SECRET_KEY}
+    depends_on: 
+      - s3
+      - pgdb
+    command: bash -c 
+      "mlflow server --backend-store-uri postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pgdb:5432/${POSTGRES_DATABASE} --host 0.0.0.0 --default-artifact-root s3://${BUCKET_NAME}/"
+    networks:
+      - default
